@@ -1,0 +1,34 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/dji/mavic/protos/Mavic2Pro.proto"
+
+WorldInfo {
+  basicTimeStep 8
+}
+Viewpoint {
+  orientation 0.36606356639593257 0.3881236664435978 -0.8457880851039872 1.6795674862523244
+  position -0.16425403714582337 2.1337006451111304 2.4572804644363995
+  follow "interceptor"
+  followSmoothness 0.05
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+RectangleArena {
+}
+Mavic2Pro {
+  translation 0 0 0.1
+  name "interceptor"
+  controller "interceptor"
+  supervisor TRUE
+}
+DEF TARGET Mavic2Pro {
+  translation 8 0 5
+  name "target_drone"
+  controller "Target"
+  supervisor TRUE
+}

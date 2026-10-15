@@ -1,0 +1,275 @@
+"""Interceptor drone controller (Mavic 2 Pro) - self-calibrating version with RTH & Landing.
+Phases: CLIMB -> CAL_YAW -> SETTLE_YAW -> CAL_FWD -> BRAKE1 -> CAL_LEFT -> BRAKE2 -> CHASE -> RTH -> LAND
+"""
+import math
+from controller import Supervisor
+
+# Stabilisation gains (from the Webots Mavic sample) - don't change
+K_VERTICAL_THRUST = 68.5
+K_VERTICAL_OFFSET = 0.6
+K_VERTICAL_P = 3.0
+K_ROLL_P = 50.0
+K_PITCH_P = 30.0
+
+# Settings
+HOVER_ONLY = False
+CLIMB_RATE = 0.8
+K_APPROACH = 0.8
+V_MAX = 4.5
+KV = 0.6
+MAX_TILT_CMD = 1.8
+LEAD_TIME = 0.8
+INTERCEPT_DIST = 1.5
+MAX_SAFE_TILT = 0.7
+CHASE_RAMP = 2.0
+
+# Calibration settings
+CAL_CMD = 0.4
+CAL_TIME = 1.5
+CAL_YAW_CMD = 1.0
+CAL_YAW_TIME = 1.0
+SETTLE_TIME = 2.0
+BRAKE_TIME = 2.0
+KY = 1.0
+KYD = 0.7
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(v, hi))
+
+
+def wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+robot = Supervisor()
+dt_ms = int(robot.getBasicTimeStep())
+dt = dt_ms / 1000.0
+
+imu = robot.getDevice("inertial unit");
+imu.enable(dt_ms)
+gps = robot.getDevice("gps");
+gps.enable(dt_ms)
+gyro = robot.getDevice("gyro");
+gyro.enable(dt_ms)
+
+motors = {n: robot.getDevice(n + " propeller") for n in
+          ("front left", "front right", "rear left", "rear right")}
+for m in motors.values():
+    m.setPosition(float("inf"))
+    m.setVelocity(1.0)
+
+target = robot.getFromDef("TARGET")
+if target is None:
+    raise RuntimeError("Add DEF TARGET to the target node")
+
+# Let sensors settle and record Home Position
+while robot.step(dt_ms) != -1:
+    if robot.getTime() > 1.0:
+        break
+
+home_pos = gps.getValues()[:2]  # Record take-off X, Y coordinates
+alt_set = gps.getValues()[2]
+prev_pos = None
+prev_tgt = None
+tvel_f = [0.0, 0.0, 0.0]
+intercepted = False
+landed = False
+last_print = 0.0
+
+phase = "CLIMB"
+phase_t0 = robot.getTime()
+sign_yaw = sign_fwd = sign_left = 1
+yaw_accum = 0.0
+v0 = 0.0
+
+
+def go(new_phase):
+    global phase, phase_t0
+    phase = new_phase
+    phase_t0 = robot.getTime()
+
+
+while robot.step(dt_ms) != -1:
+    t = robot.getTime()
+    roll, pitch, yaw = imu.getRollPitchYaw()
+    pos = gps.getValues()
+    gyro_x, gyro_y, gyro_z = gyro.getValues()
+    tgt = target.getPosition()
+
+    vel = [0, 0, 0] if prev_pos is None else [(pos[i] - prev_pos[i]) / dt for i in range(3)]
+    if prev_tgt is not None:
+        for i in range(3):
+            tvel_f[i] = 0.9 * tvel_f[i] + 0.1 * (tgt[i] - prev_tgt[i]) / dt
+    prev_pos, prev_tgt = list(pos), list(tgt)
+
+    c, s = math.cos(yaw), math.sin(yaw)
+    vx_b = c * vel[0] + s * vel[1]
+    vy_b = -s * vel[0] + c * vel[1]
+    speed = math.hypot(vel[0], vel[1])
+
+    aim = [tgt[i] + tvel_f[i] * LEAD_TIME for i in range(3)]
+
+    # Altitude management based on phase
+    if HOVER_ONLY or phase != "CHASE":
+        if phase == "RTH":
+            goal_alt = 4.0  # Cruise height during return
+        elif phase == "LAND":
+            goal_alt = 0.1  # Ground level
+        else:
+            goal_alt = 4.0  # Calibration hover height
+    else:
+        goal_alt = 5.0  # Target height during chase
+
+    alt_set += clamp(goal_alt - alt_set, -CLIMB_RATE * dt, CLIMB_RATE * dt)
+    dist = math.dist(pos, tgt)
+    tilted = abs(roll) > MAX_SAFE_TILT or abs(pitch) > MAX_SAFE_TILT
+    elapsed = t - phase_t0
+
+    yaw_raw = fwd_raw = left_raw = None
+    dvx = dvy = 0.0
+
+    if HOVER_ONLY:
+        pass
+    elif phase == "CLIMB":
+        if t >= 6.0 and abs(pos[2] - 3.0) < 0.4 and speed < 0.3:
+            yaw_accum = 0.0
+            go("CAL_YAW")
+    elif phase == "CAL_YAW":
+        yaw_raw = CAL_YAW_CMD
+        yaw_accum += gyro_z * dt
+        if elapsed >= CAL_YAW_TIME:
+            sign_yaw = 1 if yaw_accum > 0 else -1
+            print(f"CALIBRATION yaw: turned {yaw_accum:+.2f} rad -> sign_yaw={sign_yaw:+d}")
+            go("SETTLE_YAW")
+    elif phase == "SETTLE_YAW":
+        if elapsed >= SETTLE_TIME:
+            v0 = vx_b
+            go("CAL_FWD")
+    elif phase == "CAL_FWD":
+        fwd_raw = CAL_CMD
+        if elapsed >= CAL_TIME:
+            d = vx_b - v0
+            sign_fwd = 1 if d > 0 else -1
+            print(f"CALIBRATION forward: speed change {d:+.2f} m/s -> sign_fwd={sign_fwd:+d}")
+            go("BRAKE1")
+    elif phase == "BRAKE1":
+        if elapsed >= BRAKE_TIME:
+            v0 = vy_b
+            go("CAL_LEFT")
+    elif phase == "CAL_LEFT":
+        left_raw = CAL_CMD
+        if elapsed >= CAL_TIME:
+            d = vy_b - v0
+            sign_left = 1 if d > 0 else -1
+            print(f"CALIBRATION left: speed change {d:+.2f} m/s -> sign_left={sign_left:+d}")
+            go("BRAKE2")
+    elif phase == "BRAKE2":
+        if elapsed >= BRAKE_TIME:
+            go("CHASE")
+    elif phase == "CHASE":
+        scale = clamp(elapsed / CHASE_RAMP, 0.0, 1.0)
+
+        lead_factor = 1.2
+        aim_x = tgt[0] + tvel_f[0] * lead_factor
+        aim_y = tgt[1] + tvel_f[1] * lead_factor
+
+        dvx = tvel_f[0] + 0.8 * (aim_x - pos[0])
+        dvy = tvel_f[1] + 0.8 * (aim_y - pos[1])
+
+        sp = math.hypot(dvx, dvy)
+        if sp > 4.5:
+            dvx, dvy = dvx * 4.5 / sp, dvy * 4.5 / sp
+
+        dvx, dvy = dvx * scale, dvy * scale
+
+        if dist < INTERCEPT_DIST and not intercepted:
+            intercepted = True
+            print(f"DIRECT INTERCEPT & TARGET NEUTRALIZED at t={t:.2f}s! Initiating RTH...")
+
+            # Drop Target
+            try:
+                target_node = robot.getFromDef("TARGET")
+                if target_node is not None:
+                    target_controller_field = target_node.getField("controller")
+                    if target_controller_field:
+                        target_controller_field.setString("void")
+            except Exception as e:
+                print(f"Supervisor target drop error: {e}")
+
+            go("RTH")
+
+    elif phase == "RTH":
+        # Fly back to home X, Y coordinates
+        home_dist = math.hypot(home_pos[0] - pos[0], home_pos[1] - pos[1])
+        if home_dist < 0.8:
+            print("Reached Home Position. Landing...")
+            go("LAND")
+        else:
+            dvx = 1.2 * (home_pos[0] - pos[0])
+            dvy = 1.2 * (home_pos[1] - pos[1])
+            sp = math.hypot(dvx, dvy)
+            if sp > 3.0:
+                dvx, dvy = dvx * 3.0 / sp, dvy * 3.0 / sp
+
+    elif phase == "LAND":
+        # Descend straight down to take-off point
+        dvx = dvy = 0.0
+        if pos[2] < 0.2:
+            landed = True
+
+    # --- CONTROL MIXING ---
+    if landed:
+        fl = fr = rl = rr = 0.0  # Fully disarm motors upon landing touch-down
+    else:
+        evx, evy = dvx - vel[0], dvy - vel[1]
+        ex_b = c * evx + s * evy
+        ey_b = -s * evx + c * evy
+
+        fwd_cmd = clamp(sign_fwd * KV * ex_b, -MAX_TILT_CMD, MAX_TILT_CMD) if phase not in ["RTH", "LAND"] else clamp(
+            sign_fwd * 0.3 * ex_b, -1.0, 1.0)
+        left_cmd = clamp(sign_left * KV * ey_b, -MAX_TILT_CMD, MAX_TILT_CMD) if phase not in ["RTH", "LAND"] else clamp(
+            sign_left * 0.3 * ey_b, -1.0, 1.0)
+
+        if fwd_raw is not None:
+            fwd_cmd = fwd_raw
+        if left_raw is not None:
+            left_cmd = left_raw
+        if tilted:
+            fwd_cmd = left_cmd = 0.0
+
+        if HOVER_ONLY or phase == "CLIMB":
+            yaw_in = 0.0
+        elif yaw_raw is not None:
+            yaw_in = yaw_raw
+        else:
+            yaw_in = sign_yaw * clamp(KY * wrap(0.0 - yaw) - KYD * gyro_z, -1.5, 1.5)
+
+        pitch_disturbance = -fwd_cmd
+        roll_disturbance = left_cmd
+
+        roll_in = K_ROLL_P * clamp(roll, -1, 1) + gyro_x + roll_disturbance
+        pitch_in = K_PITCH_P * clamp(pitch, -1, 1) + gyro_y + pitch_disturbance
+
+        alt_err = clamp(alt_set - pos[2] + K_VERTICAL_OFFSET, -1.5, 1.5)
+        vert_in = 6.0 * alt_err
+
+        raw_tilt_comp = 1.0 / max(0.1, math.cos(roll) * math.cos(pitch))
+        tilt_compensation = min(raw_tilt_comp, 1.5)
+        compensated_thrust = K_VERTICAL_THRUST * tilt_compensation
+
+        fl = compensated_thrust + vert_in - yaw_in + pitch_in - roll_in
+        fr = compensated_thrust + vert_in + yaw_in + pitch_in + roll_in
+        rl = compensated_thrust + vert_in + yaw_in - pitch_in - roll_in
+        rr = compensated_thrust + vert_in - yaw_in - pitch_in + roll_in
+
+    motors["front left"].setVelocity(fl)
+    motors["front right"].setVelocity(-fr)
+    motors["rear left"].setVelocity(-rl)
+    motors["rear right"].setVelocity(rr)
+
+    if t - last_print >= 1.0:
+        last_print = t
+        state = "LANDED" if landed else phase
+        print(f"t={t:.0f}s {state} alt={pos[2]:.1f} speed={speed:.1f} dist={dist:.1f} "
+              f"roll={roll:.2f} pitch={pitch:.2f} yaw={yaw:.2f}")
